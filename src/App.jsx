@@ -1,5 +1,43 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, Square, Plus, Minus, MonitorPlay, Smartphone, Settings2, RefreshCw, ArrowLeft, Image as ImageIcon, Palette, X, Copy, Check } from 'lucide-react';
+import { Play, Pause, Square, Plus, Minus, MonitorPlay, Smartphone, Settings2, RefreshCw, ArrowLeft, Image as ImageIcon, Palette, X, Copy, Check, Cloud } from 'lucide-react';
+
+// Firebase Imports
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+// Inisialisasi Firebase (Mendeteksi env Canvas atau env Vercel/Vite)
+const getFirebaseConfig = () => {
+  if (typeof __firebase_config !== 'undefined') {
+    return JSON.parse(__firebase_config);
+  }
+  
+  // Fallback untuk Vercel (menggunakan Vite env variables).
+  // Dieksekusi melalui Function string untuk mencegah error static analyzer pada environment ES2015.
+  try {
+    const viteEnv = new Function("try { return import.meta.env; } catch(e) { return null; }")();
+    if (viteEnv && viteEnv.VITE_FIREBASE_API_KEY) {
+      return {
+        apiKey: viteEnv.VITE_FIREBASE_API_KEY,
+        authDomain: viteEnv.VITE_FIREBASE_AUTH_DOMAIN,
+        projectId: viteEnv.VITE_FIREBASE_PROJECT_ID,
+        storageBucket: viteEnv.VITE_FIREBASE_STORAGE_BUCKET,
+        messagingSenderId: viteEnv.VITE_FIREBASE_MESSAGING_SENDER_ID,
+        appId: viteEnv.VITE_FIREBASE_APP_ID
+      };
+    }
+  } catch (error) {
+    // Abaikan jika tidak berjalan di environment yang mendukung
+  }
+  
+  return null;
+};
+
+const firebaseConfig = getFirebaseConfig();
+const firebaseApp = firebaseConfig ? initializeApp(firebaseConfig) : null;
+const auth = firebaseApp ? getAuth(firebaseApp) : null;
+const db = firebaseApp ? getFirestore(firebaseApp) : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'my-vercel-scoreboard';
 
 const DEFAULT_STATE = {
   sport: 'football', // football, volleyball, esport, table_tennis
@@ -24,18 +62,41 @@ export default function App() {
   const [gameState, setGameState] = useState(DEFAULT_STATE);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [copiedLink, setCopiedLink] = useState(null);
+  
+  // Cloud & Local Sync States
+  const [user, setUser] = useState(null);
+  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  
   const channelRef = useRef(null);
   const timerRef = useRef(null);
 
-  // Initialize BroadcastChannel for tab-to-tab communication
+  // 1. Inisialisasi Autentikasi Firebase
+  useEffect(() => {
+    if (!auth) return;
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Firebase Auth Error:", error);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Local Sync (BroadcastChannel) fallback & Listener
   useEffect(() => {
     channelRef.current = new BroadcastChannel('obs_scoreboard_sync');
     
     if (mode === 'overlay') {
-      document.body.style.backgroundColor = 'transparent'; // Essential for OBS
+      document.body.style.backgroundColor = 'transparent';
       channelRef.current.onmessage = (event) => {
-        if (event.data) {
-          // Fallback missing states for backward compatibility if needed
+        if (event.data && !isCloudSyncing) {
           const data = event.data;
           if (!data.design) data.design = DEFAULT_STATE.design;
           setGameState(data);
@@ -43,16 +104,54 @@ export default function App() {
       };
     } else if (mode === 'controller') {
       document.body.style.backgroundColor = '#f3f4f6';
-      // Sync initial state to overlay when controller opens
       channelRef.current.postMessage(gameState);
     }
 
     return () => {
       if (channelRef.current) channelRef.current.close();
     };
-  }, [mode]);
+  }, [mode, isCloudSyncing]);
 
-  // Timer Logic (Only runs on controller, syncs to overlay)
+  // 3. Cloud Sync Listener (Firestore Real-time)
+  useEffect(() => {
+    if (!db || !user) return;
+    
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'scoreboard', 'gameState');
+    
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setIsCloudSyncing(true);
+        const data = docSnap.data();
+        if (!data.design) data.design = DEFAULT_STATE.design;
+        setGameState(data);
+      } else {
+        // Jika dokumen belum ada dan ini adalah mode controller, buat data awal
+        if (mode === 'controller') {
+          setDoc(docRef, gameState).catch(console.error);
+        }
+      }
+    }, (error) => {
+      console.error("Firestore sync error:", error);
+      setIsCloudSyncing(false);
+    });
+
+    return () => unsubscribe();
+  }, [user, mode]);
+
+  // Fungsi Helper untuk Push Data (Local & Cloud)
+  const syncState = (newState) => {
+    // Sync Lokal Antar Tab
+    if (channelRef.current) {
+      channelRef.current.postMessage(newState);
+    }
+    // Sync Cloud Lintas Perangkat
+    if (db && user) {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'scoreboard', 'gameState');
+      setDoc(docRef, newState).catch(err => console.error("Cloud Write Error:", err));
+    }
+  };
+
+  // Timer Logic (Hanya berjalan di Controller, namun tersinkron ke semua perangkat)
   useEffect(() => {
     if (mode === 'controller') {
       if (gameState.timer.isRunning) {
@@ -68,7 +167,7 @@ export default function App() {
               ...prev,
               timer: { ...prev.timer, minutes: newMin, seconds: newSec }
             };
-            channelRef.current.postMessage(newState);
+            syncState(newState); // Gunakan helper syncState
             return newState;
           });
         }, 1000);
@@ -77,7 +176,7 @@ export default function App() {
       }
     }
     return () => clearInterval(timerRef.current);
-  }, [mode, gameState.timer.isRunning]);
+  }, [mode, gameState.timer.isRunning, user]); // Tambah user di dependency agar sync cloud update dengan benar
 
   const updateState = (updater) => {
     setGameState((prev) => {
@@ -88,7 +187,7 @@ export default function App() {
       // Ensure design object exists when merging
       if (!newState.design) newState.design = DEFAULT_STATE.design;
       
-      channelRef.current.postMessage(newState);
+      syncState(newState);
       return newState;
     });
   };
@@ -126,7 +225,6 @@ export default function App() {
       img.src = event.target.result;
     };
     reader.readAsDataURL(file);
-    // Reset input value so same file can be selected again if removed
     e.target.value = null; 
   };
 
@@ -136,7 +234,6 @@ export default function App() {
       const url = new URL(window.location.href);
       url.searchParams.set('mode', targetMode);
       
-      // Copy URL ke Clipboard
       const copyText = document.createElement("textarea");
       copyText.value = url.toString();
       document.body.appendChild(copyText);
@@ -145,7 +242,7 @@ export default function App() {
       document.body.removeChild(copyText);
 
       setCopiedLink(targetMode);
-      setTimeout(() => setCopiedLink(null), 2000); // Reset icon setelah 2 detik
+      setTimeout(() => setCopiedLink(null), 2000); 
     };
 
     return (
@@ -178,7 +275,7 @@ export default function App() {
             <Settings2 size={64} className="text-emerald-400 mb-4" />
             <h2 className="text-2xl font-bold mb-2">Mode Control Panel</h2>
             <p className="text-center text-slate-400 text-sm mb-6 flex-1">
-              Pilih ini di tab terpisah atau PC lain untuk mengontrol skor dan tampilan. Perubahan akan tersinkronisasi.
+              Pilih ini di tab terpisah atau PC/HP lain untuk mengontrol skor dan tampilan. Tersinkron via Cloud.
             </p>
             <div className="w-full flex gap-3">
               <button onClick={() => setMode('controller')} className="flex-1 bg-emerald-600 hover:bg-emerald-700 py-3 rounded-xl font-bold transition-colors">
@@ -205,9 +302,8 @@ export default function App() {
               <button 
                 onClick={() => {
                   try {
-                    window.history.pushState({}, '', window.location.pathname); // Hapus query params dari URL
+                    window.history.pushState({}, '', window.location.pathname);
                   } catch (error) {
-                    // Abaikan error SecurityError jika berjalan di dalam iframe
                     console.warn("pushState diabaikan dalam lingkungan iframe.");
                   }
                   setMode(null);
@@ -218,10 +314,19 @@ export default function App() {
                 <ArrowLeft size={24} />
               </button>
               <div>
-                <h1 className="text-2xl font-bold">Control Panel</h1>
+                <h1 className="text-2xl font-bold flex items-center gap-2">
+                  Control Panel
+                </h1>
                 <p className="text-slate-400 text-sm flex items-center gap-2">
                   <span className={`w-2 h-2 rounded-full ${gameState.showOverlay ? 'bg-green-500' : 'bg-red-500'}`}></span>
                   Overlay {gameState.showOverlay ? 'Live' : 'Hidden'}
+                  
+                  {/* Indikator Cloud Syncing */}
+                  {isCloudSyncing && (
+                    <span className="flex items-center gap-1 ml-2 text-blue-400 font-semibold bg-blue-900/40 px-2 py-0.5 rounded-full" title="Cloud Sync Aktif (Real-time Database)">
+                      <Cloud size={14} /> Cloud Active
+                    </span>
+                  )}
                 </p>
               </div>
             </div>
